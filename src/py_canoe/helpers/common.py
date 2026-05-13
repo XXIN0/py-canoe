@@ -16,7 +16,7 @@ def check_if_path_exists(path: str, create_if_not_exist: bool=False) -> bool:
                 os.makedirs(path, exist_ok=True)
                 return True
             except Exception as e:
-                logger.error(f"❌ Error creating directory {path}: {e}")
+                logger.error(f"Error creating directory {path}: {e}")
                 return False
         else:
             return False
@@ -52,7 +52,7 @@ def update_logger_file_path(logger: logging.Logger, log_dir_path: str | Path) ->
         file_handler.setFormatter(logging.Formatter(fmt))
         logger.addHandler(file_handler)
     else:
-        logger.error(f"❌ Cannot update logger file path. Directory does not exist and could not be created: {os.path.dirname(new_filename)}")
+        logger.error(f"Cannot update logger file path. Directory does not exist and could not be created: {os.path.dirname(new_filename)}")
 
 
 logger = setup_logger()
@@ -73,6 +73,6 @@ def DoEventsUntil(cond, timeout, title) -> bool:
         difference = now - base_time
         seconds = difference.seconds
         if seconds > timeout:
-            logger.warning(f'⚠️ {title} timeout({timeout} s)')
+            logger.warning(f'{title} timeout({timeout} s)')
             return False
     return True
