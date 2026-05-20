@@ -23,51 +23,41 @@ Python 🐍 Package for accessing Vector CANoe 🛶 Tool via COM Interface
 - [visual studio code](https://code.visualstudio.com/Download)
 - Windows PC(recommended windows 11 OS along with 16GB RAM)
 
-## setup and installation
-
-create a python virtual environment and activate it. you can use any method to create a virtual environment; here are some examples.
+## installation
 
 ### standard way
 
 ```bash
-# create a new directory for your project (optional)
-mkdir my-project
-cd my-project
+# install py-canoe package
+pip install py-canoe
 
-# create virtual environment
-python -m venv .venv
-
-# activate virtual environment
-.venv\Scripts\activate
-
-# upgrade pip (optional but recommended)
-python -m pip install --upgrade pip
-
-# install/upgrade py-canoe package
+# upgrade py-canoe package
 pip install py-canoe --upgrade
+
+# install py-canoe package with all optional dependencies
+pip install py-canoe[all]
 ```
 
 ### using astral uv
 
 ```bash
-# install uv if not already installed (optional)
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+# install py-canoe package
+uv pip install py-canoe
 
-# create a new uv python package (optional)
-uv init my-project --package
-cd my-project
-
-# create virtual environment with uv
-uv venv .venv
-
-# activate virtual environment
-.venv\Scripts\activate
-
-# install/upgrade py-canoe package
+# upgrade py-canoe package
 uv pip install py-canoe --upgrade
 
-# add py-canoe as dependency to your pyproject.toml (optional)
+# install py-canoe package with all optional dependencies
+uv pip install py-canoe[all]
+
+# add py-canoe as dependency to your pyproject.toml
 uv add py-canoe
+
+# add py-canoe package with all optional dependencies in your pyproject.toml
+uv add py-canoe[all]
+
+# upgrade py-canoe package in your pyproject.toml
+uv update py-canoe
 ```
 
 ---
@@ -439,4 +429,66 @@ canoe_inst.stop_measurement()
 # log should be fully generated at this point for you to analyze
 canoe_inst.set_configuration_modified(False)  # to avoid popup asking to save changes
 canoe_inst.quit()
+```
+
+### server/headless mode (no GUI interaction)
+
+By default, py-canoe uses COM event sinks (`WithEvents`) to receive notifications from CANoe
+(e.g., measurement started, measurement stopped). This works well for interactive desktop applications,
+but can cause issues in server environments:
+
+**The Problem:**
+- CANoe may reject COM calls with `RPC_E_CALL_REJECTED` when it's busy (e.g., during report generation)
+- Long-running server processes need robust error handling for these transient states
+- In some scenarios, Windows may show a "program is busy" dialog (reduced in recent versions)
+
+**The Solution:**
+Use the low-level `Application` class with `enable_events=False` to disable COM event sinks.
+py-canoe will use polling instead, which is more reliable for server/headless operation:
+
+```python
+from py_canoe.core.application import Application
+
+# Create instance without COM event sinks (uses polling instead)
+app = Application(enable_events=False)
+app.open(r'tests\demo_cfg\demo.cfg', visible=True, auto_save=True, prompt_user=False)
+
+app.measurement.start()
+# ... run your test ...
+app.measurement.stop()
+app.quit()
+```
+
+**Parameters explained:**
+- `enable_events=False`: Disables COM event sinks, uses polling to detect state changes
+- `timeout`: Available on `start()` and `stop()` methods (default: 30s) - maximum time to wait
+
+**Benefits:**
+- Reduced "program is busy" dialogs (internal COM proxy sharing)
+- Automatic retry when CANoe is temporarily busy (e.g., during report generation)
+- Safe for long-running server processes (REST APIs, MCP servers, scheduled tasks)
+- Configurable timeouts for all operations
+
+**Switching configurations without restarting CANoe:**
+
+Server applications often need to run tests with different CANoe configurations.
+Use `open_config()` to switch configurations while keeping CANoe running:
+
+```python
+# CANoe is already running with a configuration
+canoe_inst.open_config(r'tests\demo_cfg\another_config.cfg', timeout=60)
+# Now running with the new configuration
+```
+
+**Custom COM message pumping:**
+
+For advanced use cases where you need to pump COM messages in your own wait loops:
+
+```python
+import time
+
+# Custom wait loop with COM message pumping
+while not my_condition():
+    canoe_inst.pump_messages()  # Process pending COM messages
+    time.sleep(0.1)
 ```
