@@ -20,6 +20,9 @@ dependencies = [
     "pywin32",
 ]
 
+[project.scripts]
+py-canoe = "py_canoe:main"
+
 [project.optional-dependencies]
 robot = ["robotframework"]
 database = ["canmatrix[arxml,ldf,xls,xlsx,yaml]", "lxml>=6.1.1"]

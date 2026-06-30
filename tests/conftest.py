@@ -9,23 +9,12 @@ def is_canoe_available() -> bool:
 
     try:
         import pythoncom
-        import win32com.client
 
-        pythoncom.CoInitialize()
-        canoe_app = win32com.client.Dispatch("CANoe.Application")
-        del canoe_app
-        pythoncom.CoUninitialize()
+        pythoncom.CLSIDFromProgID("CANoe.Application")
         return True
+
     except Exception:
-        try:
-            import pythoncom
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
         return False
 
 
-skip_if_no_canoe = pytest.mark.skipif(
-    not is_canoe_available(),
-    reason="CANoe requires Windows and COM interface"
-)
+skip_if_no_canoe = pytest.mark.skipif(not is_canoe_available(), reason="CANoe requires Windows and COM interface",)
