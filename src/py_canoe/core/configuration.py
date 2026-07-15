@@ -1,9 +1,14 @@
-from typing import TYPE_CHECKING, Iterable, Union
+from typing import TYPE_CHECKING, Iterable, Sequence, Union
+
+from py_canoe.core.child_elements.test_module import TestModule
 if TYPE_CHECKING:
     from py_canoe.core.application import Application
     from py_canoe.core.child_elements.measurement_setup import Logging, ExporterSymbol, Message
     from py_canoe.core.child_elements.test_configurations import TestConfiguration
 import os
+import re
+import time
+from fnmatch import fnmatchcase
 import win32com.client
 
 from py_canoe.core.child_elements.c_libraries import CLibraries
@@ -51,6 +56,8 @@ class Configuration:
     def fetch_test_modules(self):
         for te_name, te_inst in self.__test_setup_environments.items():
             for tm_name, tm_inst in te_inst.get_all_test_modules().items():
+                # A TestSetupItem object that either can be a TSTestModule object or a TestSetupFolder object.
+                # TestSetupFolder有items，包含TestSetupItems
                 self.__test_modules.append({'name': tm_name, 'object': tm_inst, 'environment': te_name})
 
     def fetch_test_units(self):
@@ -428,7 +435,149 @@ class Configuration:
             logger.error(f'failed to get test modules. {e}')
             return {}
 
-    def execute_test_module(self, test_module_name: str) -> int:
+    @staticmethod
+    def _match_test_case_name(name: str, pattern: str) -> bool:
+        """Check if a test case name matches a pattern.
+
+        Supports two matching modes:
+        - Regex: patterns starting with '(?i)' or '(?' are treated as regex.
+                 Also treats as regex if the pattern contains regex metacharacters
+                 like '^', '$', '[', ']', '+', '{', '}' (but not '*' or '?'
+                 alone, as those are valid glob chars).
+        - Wildcard (default): uses fnmatch-style patterns where:
+                * matches everything
+                ? matches any single character
+                [seq] matches any character in seq
+                [!seq] matches any character not in seq
+
+        Args:
+            name: The test case name to check.
+            pattern: The pattern to match against.
+
+        Returns:
+            bool: True if the name matches the pattern.
+        """
+        # Treat as regex if it starts with '(?' or contains regex-specific syntax.
+        # Distinguish from fnmatch glob by inspecting bracket/brace contents:
+        #   - [...\d...] or [[:alpha:]] → regex (fnmatch doesn't support \d, POSIX classes)
+        #   - {3} or {1,3}             → regex quantifier (digits inside braces)
+        #   - {foo,bar}                → fnmatch alternation (commas inside braces)
+        #
+        # Why not just try re.search() first and fall back to fnmatch on
+        # re.error? Because an *invalid* regex raises re.error and would fall
+        # back correctly, BUT a *valid* regex that the user actually meant as a
+        # glob (e.g. "TC_[0-9]") would be silently interpreted as regex
+        # and match differently. The heuristic below keeps glob the default
+        # and only escalates to regex when we see unambiguous regex markers.
+        is_regex = pattern.startswith('(?')
+        if not is_regex:
+            # Check for unambiguous regex markers outside bracket context
+            # (strip [...] and {...} first to avoid false positives from glob syntax)
+            stripped = re.sub(r'\[.*?\]', '', pattern)
+            stripped = re.sub(r'\{.*?\}', '', stripped)
+            if re.search(r'[+^$]|\\[dDwWsSbB]|\\\(|\\\{|\\\[' , stripped):
+                is_regex = True
+            # Check bracket contents for regex-specific escapes
+            # Use greedy match to handle nested brackets like [[:alpha:]]
+            for m in re.finditer(r'\[(.+)\]', pattern):
+                if re.search(r'\\[dDwWsSbB]|\[:\w+:\]', m.group(1)):
+                    is_regex = True
+                    break
+            # Check brace contents:
+            #   {3} or {1,3} → regex quantifier (digits, optionally with comma)
+            #   {foo,bar}    → fnmatch alternation (text with comma, Python fnmatch
+            #                  doesn't expand braces so it matches literally)
+            for m in re.finditer(r'\{([^}]+)\}', pattern):
+                content = m.group(1)
+                if re.match(r'^\d+$', content) or re.match(r'^\d+,\d*$', content):
+                    is_regex = True
+                    break
+        if is_regex:
+            try:
+                return bool(re.search(pattern, name))
+            except re.error:
+                # Fall back to literal match if regex is invalid
+                return name == pattern
+        # Otherwise use fnmatch wildcard matching
+        return fnmatchcase(name, pattern)
+
+    def _apply_test_case_selection(self, tm_obj:TestModule, enable_patterns: Sequence[str], disable_patterns: Sequence[str], match_by: str = "name") -> None:
+        """Apply test case enable/disable selections based on patterns.
+
+        Iterates all test cases in the test module and matches each name (or
+        title, see ``match_by``) against the given patterns.
+        disable_patterns takes precedence over enable_patterns.
+
+        Args:
+            tm_obj: The TestModule COM object.
+            enable_patterns: Patterns for test cases to enable.
+            disable_patterns: Patterns for test cases to disable.
+            match_by: Which test case attribute to match the patterns against.
+                Either "name" (default) or "title".
+        """
+        if match_by not in ("name", "title"):
+            logger.warning(f'Invalid match_by="{match_by}", falling back to "name".')
+            match_by = "name"
+
+        # Coerce a bare string into a single-element sequence. Passing a string
+        # (e.g. "XM_CSflash_FUNC_00*") would otherwise be iterated character by
+        # character, and the '*' character alone would match every test case.
+        if isinstance(enable_patterns, str):
+            enable_patterns = [enable_patterns]
+        if isinstance(disable_patterns, str):
+            disable_patterns = [disable_patterns]
+
+        if not enable_patterns and not disable_patterns:
+            return
+
+        all_test_cases = tm_obj.get_all_test_cases()
+
+        if not all_test_cases:
+            logger.warning(f'No test cases found in test module ({tm_obj.name}).')
+            return
+
+        # When matching by title, check up front whether any title is available.
+        # Many module types (e.g. CAPL test modules) do not expose a Title at
+        # all. If no title exists at all, there is nothing to match against,
+        # so warn once and skip the whole matching loop (matching empty
+        # titles would never hit and just wastes a full iteration).
+        if match_by == "title" and not any(tc.title for tc in all_test_cases.values()):
+            logger.warning(
+                f'Test module "{tm_obj.name}" has no test case titles available; '
+                f'title patterns will not match anything, skipping selection.'
+            )
+            return
+
+        for tc_name, tc in all_test_cases.items():
+            # Match against the requested attribute (name or title).
+            # print(f"Checking test case: {tc_name}, title: {tc.title}, ident: {tc.ident}, enabled: {tc.enabled}, verdict: {tc.verdict_name}")
+            match_value = tc.title if match_by == "title" else tc.name
+            should_enable = False
+            should_disable = False
+
+            # Check disable patterns first (higher priority)
+            for pattern in disable_patterns:
+                if self._match_test_case_name(match_value, pattern):
+                    should_disable = True
+                    break
+
+            # Check enable patterns only if not already matched by disable
+            if not should_disable:
+                for pattern in enable_patterns:
+                    if self._match_test_case_name(match_value, pattern):
+                        should_enable = True
+                        break
+
+            if should_disable:
+                if tc.enabled:
+                    tc.enabled = False
+                    logger.info(f'Test case "{tc_name}" disabled by pattern match.')
+            elif should_enable:
+                if not tc.enabled:
+                    tc.enabled = True
+                    logger.info(f'Test case "{tc_name}" enabled by pattern match.')
+
+    def execute_test_module(self, test_module_name: str, enable_test_cases: Sequence[str] = (), disable_test_cases: Sequence[str] = (), match_by: str = "name") -> int:
         try:
             test_verdict = {0: 'NotAvailable',
                             1: 'Passed',
@@ -437,49 +586,123 @@ class Configuration:
                             4: 'Inconclusive (not available for test modules)',
                             5: 'ErrorInTestSystem (not available for test modules)', }
             execution_result = 0
-            test_module_found = False
-            test_env_name = ''
-            for tm in self.__test_modules:
-                if tm['name'] == test_module_name:
-                    test_module_found = True
-                    tm_obj = tm['object']
-                    test_env_name = tm['environment']
-                    logger.info(f'test module "{test_module_name}" found in "{test_env_name}"')
-                    tm_obj.start()
-                    tm_obj.wait_for_completion()
-                    execution_result = tm_obj.verdict
-                    break
-                else:
-                    continue
-            if test_module_found and (execution_result == 1):
-                logger.info(f'test module "{test_env_name}.{test_module_name}" verdict = {test_verdict[execution_result]}')
-            elif test_module_found and (execution_result != 1):
-                logger.info(f'test module "{test_env_name}.{test_module_name}" verdict = {test_verdict[execution_result]}')
-            else:
-                logger.warning(f'test module "{test_module_name}" not found. not possible to execute')
+            tm_obj = self._find_test_module(test_module_name)
+            if tm_obj is not None:
+                self._apply_test_case_selection(tm_obj, enable_test_cases, disable_test_cases, match_by=match_by)
+                tm_obj.start()
+                tm_obj.wait_for_completion()
+                execution_result = tm_obj.verdict
+                logger.info(f'test module "{test_module_name}", verdict = {test_verdict[execution_result]}')
             return execution_result
         except Exception as e:
             logger.error(f'failed to execute test module. {e}')
             return 0
 
+    def _find_test_module(self, test_module_name: str) -> TestModule:
+        """Find a test module by name from the cached test modules list.
+
+        Returns:
+            TestModule wrapper object if found, None otherwise.
+        """
+        for tm in self.__test_modules:
+            if tm['name'] == test_module_name:
+                return tm['object']
+        logger.warning(f'test module "{test_module_name}" not found.')
+        return None
+
+    def get_test_module_result(self, test_module_name: str, report_timeout: float = 30.0) -> dict:
+        """Get test module execution result including report path and test case verdicts.
+
+        Should be called after execute_test_module() to retrieve the results.
+
+        Note: This method does NOT depend on the module's started state. It reads
+        the verdict and report information directly from the test module object,
+        and waits (up to ``report_timeout`` seconds) for the report-generated
+        event if it has not fired yet. The returned ``test_cases`` are live
+        ``TestCase`` objects, so accessing their attributes (e.g. ``verdict``,
+        ``enabled``) reads the latest values from CANoe.
+
+        Args:
+            test_module_name (str): name of the test module.
+            report_timeout (float): maximum time in seconds to wait for the
+                report-generated event before giving up. Defaults to 30.0.
+
+        Returns:
+            dict: A dictionary with keys:
+                - "verdict" (int): overall test module verdict (0-5)
+                - "verdict_name" (str): human-readable verdict name
+                - "report" (dict): report information with keys:
+                    - "success" (bool): whether report generation succeeded
+                    - "source_full_name" (str): XML report path
+                    - "generated_full_name" (str): HTML report path
+                - "test_cases" (dict[str, TestCase]): mapping of test case names
+                  to live TestCase objects (use .name/.enabled/.verdict/.title)
+        """
+        try:
+            tm_obj = self._find_test_module(test_module_name)
+            if tm_obj is None:
+                return {}
+
+            # Wait for the report-generated event (bounded by report_timeout) so
+            # the report paths are populated. If it already fired, this returns
+            # immediately. We do NOT gate on TM_STARTED, because the module may
+            # have been stopped (which resets TM_STARTED) by the time results
+            # are requested. Use a monotonic clock so the wait is not
+            # skewed by GIL/thread scheduling.
+            deadline = time.monotonic() + report_timeout
+            while not tm_obj.test_module_events.TM_REPORT_GENERATED and time.monotonic() < deadline:
+                wait(0.01)
+            if not tm_obj.test_module_events.TM_REPORT_GENERATED:
+                logger.warning(
+                    f'Test module "{test_module_name}" report was not generated '
+                    f'within {report_timeout}s; report paths may be empty.'
+                )
+
+            # overall verdict
+            verdict = tm_obj.verdict
+            verdict_name = tm_obj.VALUE_TABLE_VERDICT.get(verdict, "Unknown")
+
+            # report information from event sink
+            report_info = tm_obj.test_module_events.TEST_REPORT_INFORMATION
+            report = {
+                "success": report_info.get("success", False),
+                "source_full_name": report_info.get("source_full_name", ""),
+                "generated_full_name": report_info.get("generated_full_name", ""),
+            }
+
+            test_cases = tm_obj.get_all_test_cases()
+
+            return {
+                "verdict": verdict,
+                "verdict_name": verdict_name,
+                "report": report,
+                "test_cases": test_cases
+            }
+
+        except Exception as e:
+            logger.error(f'failed to get test module result for "{test_module_name}": {e}')
+            return {}
+
     def stop_test_module(self, test_module_name: str):
         try:
-            for tm in self.__test_modules:
-                if tm['name'] == test_module_name:
-                    tm['object'].stop()
-                    test_env_name = tm['environment']
-                    logger.info(f'test module "{test_module_name}" in test environment "{test_env_name}" stopped ')
-            else:
-                logger.warning(f'test module "{test_module_name}" not found. not possible to execute')
+            tm_obj = self._find_test_module(test_module_name)
+            if tm_obj is not None:
+                tm_obj.stop()
+                logger.info(f'test module "{test_module_name}" stopped.')
         except Exception as e:
             logger.error(f'failed to stop test module. {e}')
 
-    def execute_all_test_modules_in_test_env(self, env_name: str):
+    def execute_all_test_modules_in_test_env(self, env_name: str, enable_test_cases: Sequence[str] = (), disable_test_cases: Sequence[str] = (), match_by: str = "name"):
         try:
             test_modules = self.get_test_modules(env_name=env_name)
             if test_modules:
                 for tm_name in test_modules.keys():
-                    self.execute_test_module(tm_name)
+                    self.execute_test_module(
+                        tm_name,
+                        enable_test_cases=enable_test_cases,
+                        disable_test_cases=disable_test_cases,
+                        match_by=match_by,
+                    )
             else:
                 logger.warning(f'test modules not available in "{env_name}" test environment')
         except Exception as e:
