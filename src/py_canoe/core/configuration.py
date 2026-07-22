@@ -364,7 +364,7 @@ class Configuration:
                     while tc_inst.running:
                         wait(1)
                     logger.info(f'completed executing test configuration ({tc_name}) with verdict {tc_inst.test_configuration_events.VERDICT.name}')
-                return True
+            return True
         except Exception as e:
             logger.error(f'failed to execute test configuration. {e}')
             return False
