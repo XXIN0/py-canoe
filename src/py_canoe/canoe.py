@@ -559,6 +559,9 @@ class CANoe:
                                                                          match_by,
                                                                          wait_for_completion)
 
+    def get_test_configuration_cases_result(self, test_conf_name: str) -> dict:
+        return self.application.configuration.get_test_configurations_cases_result(test_conf_name)
+    
     def stop_test_configuration(self, test_configuration_name: str) -> bool:
         """stops execution of a specific test configuration.
 
